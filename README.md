@@ -8,7 +8,7 @@ Works on **Windows, Linux and macOS**.
 ## Install
 
 ```bash
-git clone https://github.com/<your-username>/lms-course-downloader.git
+git clone https://github.com/<cosmo-png>/lms-course-downloader.git
 cd lms-course-downloader
 python -m venv venv
 # Linux/macOS:  source venv/bin/activate
