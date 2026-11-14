@@ -1,0 +1,5 @@
+playwright>=1.40
+requests>=2.31
+questionary>=2.0
+rich>=13.0
+yt-dlp>=2024.1.1
