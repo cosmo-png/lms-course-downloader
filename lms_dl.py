@@ -6,6 +6,7 @@ their documents (PDF, slides...) and/or videos. Works on Windows, Linux, macOS.
 """
 import argparse
 import re
+import shutil
 import sys
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -37,6 +38,25 @@ def goto(page, url):
         page.wait_for_load_state("networkidle", timeout=15000)
     except Exception:
         pass
+
+
+# -------------------------------------------------------------- browser
+def launch_browser(p, headless, path=None):
+    """Use the installed Google Chrome (Windows, macOS, Linux). No browser download needed."""
+    if path:
+        return p.chromium.launch(executable_path=path, headless=headless)
+    try:
+        return p.chromium.launch(channel="chrome", headless=headless)
+    except Exception:
+        pass
+    names = ("google-chrome-stable", "google-chrome", "chrome", "chromium", "chromium-browser",
+             "brave", "microsoft-edge-stable")
+    found = next((shutil.which(n) for n in names if shutil.which(n)), None)
+    if found:
+        return p.chromium.launch(executable_path=found, headless=headless)
+    console.print("[red]Google Chrome not found. Install it from google.com/chrome "
+                  "or pass --browser /path/to/chrome[/red]")
+    sys.exit(1)
 
 
 # ---------------------------------------------------------------- login
@@ -201,11 +221,12 @@ def main():
     ap.add_argument("--out", default="downloads", help="output folder")
     ap.add_argument("--manual", action="store_true",
                     help="open a browser window and log in yourself (use for SSO / OTP / captcha)")
+    ap.add_argument("--browser", help="path to a Chrome executable (auto-detected if omitted)")
     args = ap.parse_args()
     base, out = args.base.rstrip("/"), Path(args.out)
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=not args.manual)
+        browser = launch_browser(p, not args.manual, args.browser)
         ctx = browser.new_context()
         page = ctx.new_page()
 

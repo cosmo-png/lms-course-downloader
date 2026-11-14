@@ -3,18 +3,30 @@
 Download your own course files (PDFs, slides, docs) and videos from a Moodle-based
 LMS. Built for Miva Open University, but works with any Moodle site via `--base`.
 
-Works on **Windows, Linux and macOS**.
+Works on **Windows, Linux and macOS** using your installed Google Chrome.
 
 ## Install
+
+You need **Python 3.9+** and **Google Chrome**. No other browser download is needed.
 
 ```bash
 git clone https://github.com/cosmo-png/lms-course-downloader.git
 cd lms-course-downloader
 python -m venv venv
-# Linux/macOS:  source venv/bin/activate
-# Windows:      venv\Scripts\activate
+```
+
+Activate the virtual environment (pick your system):
+
+| System | Command |
+|--------|---------|
+| Windows (PowerShell / cmd) | `venv\Scripts\activate` |
+| Linux / macOS (bash, zsh) | `source venv/bin/activate` |
+| Linux (fish) | `source venv/bin/activate.fish` |
+
+Then:
+
+```bash
 pip install -r requirements.txt
-playwright install chromium
 ```
 
 ## Use
