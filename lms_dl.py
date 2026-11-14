@@ -2,12 +2,13 @@
 """
 LMS Course Downloader (Moodle).
 Logs in, lists your enrolled courses, lets you pick some, and downloads
-their documents (PDF, slides...) and/or videos. Works on Windows, Linux, macOS.
+their documents (PDF, slides...) and/or videos. Windows, Linux, macOS.
 """
 import argparse
 import re
 import shutil
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -17,11 +18,19 @@ from playwright.sync_api import sync_playwright
 from rich.console import Console
 
 console = Console()
+STATE_FILE = Path.home() / ".lms-dl" / "session.json"
+stats = {"saved": 0, "had": 0, "failed": 0}
 
 DOC_EXT = {".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".zip", ".epub", ".txt"}
 VID_EXT = {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
 EXTERNAL_VIDEO = ("youtube.com", "youtu.be", "vimeo.com", "wistia", "dailymotion.com", "loom.com")
 ACTIVITY_RE = re.compile(r"/mod/(resource|folder|page|url|book|kalvidres|videotime|hvp|lti)/view\.php")
+
+
+def ask(question):
+    """Run a questionary prompt in its own thread (Playwright already owns the event loop)."""
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        return ex.submit(question.ask).result()
 
 
 def safe(name: str) -> str:
@@ -60,15 +69,80 @@ def launch_browser(p, headless, path=None):
 
 
 # ---------------------------------------------------------------- login
+def logged_in(page, base) -> bool:
+    goto(page, f"{base}/my/courses.php")
+    return "/login/" not in page.url and page.locator('input[type="password"]').count() == 0
+
+
 def login(page, base, username, password) -> bool:
     goto(page, f"{base}/login/index.php")
-    if page.locator("#username").count() == 0:
-        return "login" not in page.url
-    page.fill("#username", username)
-    page.fill("#password", password)
-    page.click("#loginbtn")
-    page.wait_for_load_state("networkidle")
-    return "/login/" not in page.url
+    user_box = page.locator('#username, input[name="username"], input[type="email"]').first
+    pass_box = page.locator('#password, input[type="password"]').first
+    if user_box.count() == 0 or pass_box.count() == 0:
+        console.print("[yellow]No normal login form found (probably single sign-on).[/yellow]")
+        return False
+    if page.locator('iframe[src*="recaptcha"], .g-recaptcha, iframe[src*="hcaptcha"]').count():
+        console.print("[yellow]The login page has a captcha, so a human has to log in.[/yellow]")
+        return False
+    user_box.fill(username)
+    pass_box.fill(password)
+    pass_box.press("Enter")
+    try:
+        page.wait_for_load_state("networkidle", timeout=20000)
+    except Exception:
+        pass
+    if "/login/" in page.url or page.locator('input[type="password"]').count():
+        err = page.locator("#loginerrormessage, .loginerrors, .alert-danger").first
+        msg = err.inner_text().strip() if err.count() else "no error message shown"
+        console.print(f"[yellow]Login not accepted: {msg}[/yellow]")
+        return False
+    return True
+
+
+def authenticate(p, args, base):
+    """Return (browser, context, page) with a logged-in session."""
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if args.forget and STATE_FILE.exists():
+        STATE_FILE.unlink()
+        console.print("Saved session removed.")
+
+    browser = launch_browser(p, True, args.browser)
+    try:
+        ctx = browser.new_context(storage_state=str(STATE_FILE) if STATE_FILE.exists() else None)
+    except Exception:
+        ctx = browser.new_context()
+    page = ctx.new_page()
+
+    if logged_in(page, base):
+        console.print("[green]Using your saved session.[/green]")
+        return browser, ctx, page
+
+    ok = False
+    if not args.manual:
+        user = ask(questionary.text("Username / email:"))
+        pw = ask(questionary.password("Password (hidden, never stored):"))
+        ok = bool(user and pw) and login(page, base, user, pw)
+
+    if not ok:
+        console.print("Opening a Chrome window. Log in there, then come back here.")
+        browser.close()
+        browser = launch_browser(p, False, args.browser)
+        ctx = browser.new_context()
+        page = ctx.new_page()
+        goto(page, f"{base}/login/index.php")
+        input("Press Enter once you can see your dashboard... ")
+        if not logged_in(page, base):
+            console.print("[red]Still not logged in. Please try again.[/red]")
+            sys.exit(1)
+
+    if not args.no_save:
+        ctx.storage_state(path=str(STATE_FILE))
+        try:
+            STATE_FILE.chmod(0o600)
+        except OSError:
+            pass
+        console.print(f"Session saved to {STATE_FILE} (remove it any time with --forget).")
+    return browser, ctx, page
 
 
 def make_session(ctx) -> requests.Session:
@@ -99,7 +173,6 @@ def get_courses(page, base):
         return [{"id": c["id"], "name": c["fullname"], "url": c["viewurl"]} for c in data[0]["data"]["courses"]]
     except Exception:
         pass
-    # fallback: scrape the links on the page
     items = page.eval_on_selector_all(
         'a[href*="course/view.php?id="]', "els => els.map(e => [e.href, e.textContent.trim()])"
     )
@@ -124,6 +197,7 @@ def save_stream(sess, url, folder: Path, allowed):
     try:
         with sess.get(url, stream=True, allow_redirects=True, timeout=60) as r:
             if r.status_code != 200:
+                stats["failed"] += 1
                 return "fail"
             if "text/html" in r.headers.get("content-type", ""):
                 return "html"
@@ -134,6 +208,7 @@ def save_stream(sess, url, folder: Path, allowed):
             dest = folder / safe(name)
             if dest.exists():
                 console.print(f"    = already have {dest.name}")
+                stats["had"] += 1
                 return "saved"
             part = dest.with_name(dest.name + ".part")
             with open(part, "wb") as f:
@@ -141,9 +216,11 @@ def save_stream(sess, url, folder: Path, allowed):
                     f.write(chunk)
             part.rename(dest)
             console.print(f"    [green]+ {dest.name}[/green]")
+            stats["saved"] += 1
             return "saved"
     except Exception as e:
         console.print(f"    [red]! {url} -> {e}[/red]")
+        stats["failed"] += 1
         return "fail"
 
 
@@ -155,8 +232,10 @@ def ytdlp(url, folder: Path):
         with yt_dlp.YoutubeDL(opts) as y:
             y.download([url])
         console.print(f"    [green]+ video {url}[/green]")
+        stats["saved"] += 1
     except Exception as e:
         console.print(f"    [red]! video failed {url} -> {e}[/red]")
+        stats["failed"] += 1
 
 
 def harvest(page, url):
@@ -219,51 +298,58 @@ def main():
     ap = argparse.ArgumentParser(description="Download your Moodle course files and videos.")
     ap.add_argument("--base", default="https://lms.miva.university", help="LMS base URL")
     ap.add_argument("--out", default="downloads", help="output folder")
-    ap.add_argument("--manual", action="store_true",
-                    help="open a browser window and log in yourself (use for SSO / OTP / captcha)")
+    ap.add_argument("--manual", action="store_true", help="skip the password prompt and log in yourself in Chrome")
+    ap.add_argument("--forget", action="store_true", help="delete the saved login session first")
+    ap.add_argument("--no-save", action="store_true", help="do not save the login session")
     ap.add_argument("--browser", help="path to a Chrome executable (auto-detected if omitted)")
     args = ap.parse_args()
     base, out = args.base.rstrip("/"), Path(args.out)
 
     with sync_playwright() as p:
-        browser = launch_browser(p, not args.manual, args.browser)
-        ctx = browser.new_context()
-        page = ctx.new_page()
-
-        if args.manual:
-            goto(page, f"{base}/login/index.php")
-            console.print("Log in in the browser window, then come back here.")
-            input("Press Enter once you can see your dashboard... ")
-        else:
-            user = questionary.text("Username / email:").ask()
-            pw = questionary.password("Password (hidden, never stored):").ask()
-            if not user or not pw or not login(page, base, user, pw):
-                console.print("[red]Login failed. Try again with --manual.[/red]")
-                sys.exit(1)
+        browser, ctx, page = authenticate(p, args, base)
 
         courses = get_courses(page, base)
         if not courses:
-            console.print("[red]No courses found.[/red]")
+            console.print("[red]No courses found on your classes page.[/red]")
             sys.exit(1)
+        console.print(f"Found [bold]{len(courses)}[/bold] courses.")
 
-        chosen = questionary.checkbox(
-            "Select courses (space to tick, enter to confirm):",
-            choices=[questionary.Choice(c["name"], value=c) for c in courses],
-        ).ask()
+        choices = [questionary.Choice("*** ALL COURSES ***", value="__all__")]
+        choices += [questionary.Choice(c["name"], value=c) for c in courses]
+        chosen = ask(questionary.checkbox(
+            "Select courses:",
+            choices=choices,
+            instruction="(arrows move, SPACE ticks, ENTER confirms)",
+            validate=lambda sel: True if sel else "Press SPACE to tick at least one course, then ENTER",
+        ))
         if not chosen:
             return
-        kind = questionary.select(
+        if "__all__" in chosen:
+            chosen = courses
+
+        kind = ask(questionary.select(
             "What do you want to download?",
             choices=["Files (PDFs, slides, docs)", "Videos", "Both"],
-        ).ask()
+        ))
+        if not kind:
+            return
         want_docs, want_vids = kind != "Videos", kind != "Files (PDFs, slides, docs)"
 
         sess = make_session(ctx)
         for c in chosen:
             process_course(page, sess, c, out, want_docs, want_vids)
-        console.print(f"\n[bold green]Done.[/bold green] Saved in: {out.resolve()}")
+
+        console.print(f"\n[bold green]Done.[/bold green] {stats['saved']} new, "
+                      f"{stats['had']} already had, {stats['failed']} failed.")
+        console.print(f"Saved in: {out.resolve()}")
+        if stats["saved"] + stats["had"] == 0:
+            console.print("[yellow]Nothing was downloaded. Send the output above to the maintainer "
+                          "so the course layout can be supported.[/yellow]")
         browser.close()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        console.print("\nStopped.")
